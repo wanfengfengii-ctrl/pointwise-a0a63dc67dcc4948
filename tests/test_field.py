@@ -1,14 +1,17 @@
 from fractions import Fraction
 import json
+import random
 
 from field.export import export_ledger, format_result
 from field.query import query_probe
 from field.session import open_session
 from history.basins import build_history, compute_summary
 from history.levels import activation_levels
+from history.moments import BasinMoments
+from history.summary import BasinEvent, BasinSummary, SummarySource
 from registry import NotFoundError
 from release.bundle import BundleError, encode_bundle, export_bundle
-from release.manifest import build_manifest
+from release.manifest import ReleaseManifest, build_manifest
 from survey.catalog import get_plan
 from terrain.revisions import get_revision
 from tests.fixtures import RegistryTestCase, cell, probe, reading, saddle_inputs
@@ -209,3 +212,126 @@ class FieldTests(RegistryTestCase):
         record['summary']['events'][0]['area'] = [2, 2]
         with self.assertRaisesRegex(BundleError, 'reduced'):
             open_session(json.dumps(record).encode('utf-8'))
+
+    def test_successive_merges(self):
+        # INCIDENT.md: 3x3, only cells 0, 1, 2, 3, 6 valid.  Cells 0, 2, 6
+        # stand at 0 m with areas 1, 2, 3; cells 1 and 3 have area 1 and swap
+        # heights between the two revisions.
+        def rows(cell_one, cell_three):
+            return [
+                [cell(0, 1), cell(cell_one, 1), cell(0, 2)],
+                [cell(cell_three, 1), None, None],
+                [cell(0, 3), None, None],
+            ]
+
+        expected = {
+            'forward': {2: (0, Fraction(2)), '5/2': (0, Fraction(8)), '7/2': (0, Fraction(23))},
+            'reverse': {2: (0, Fraction(2)), '5/2': (0, Fraction(21, 2)), '7/2': (0, Fraction(23))},
+        }
+        for label, (one, three), revision, plan, release in (
+            ('forward', (2, 3), 'ra', 'pa', 'ea'),
+            ('reverse', (3, 2), 'rb', 'pb', 'eb'),
+        ):
+            with self.subTest(composition=label):
+                bundle = self.issue(
+                    rows(one, three), [probe('visit', 0, 0)],
+                    revision=revision, plan=plan, release=release,
+                )
+                for water, (basin_id, volume) in expected[label].items():
+                    result = query_probe(bundle, 'visit', water)
+                    self.assertEqual(
+                        (result.status, result.basin_id, result.volume),
+                        ('wet', basin_id, volume),
+                        f'BASIN_HANDOFF_MISMATCH: successive merges at {water}',
+                    )
+
+    def test_seeded_exhaustive_oracle(self):
+        rng = random.Random(20240607)
+        heights = ('-1', '0', '1/3', '1', '3/2', '2')
+        areas = ('1/2', '1', '2', '5/3')
+        for trial in range(24):
+            row_count = rng.randint(1, 3)
+            column_count = rng.randint(1, 4)
+            rows = []
+            for _ in range(row_count):
+                raw_row = []
+                for _ in range(column_count):
+                    if rng.random() < 0.15:
+                        raw_row.append(None)
+                    else:
+                        raw_row.append(cell(rng.choice(heights), rng.choice(areas)))
+                rows.append(raw_row)
+            points = [probe(f'{row}-{column}', row, column)
+                      for row, raw_row in enumerate(rows)
+                      for column, raw in enumerate(raw_row) if raw is not None]
+            if not points:
+                continue
+            with self.subTest(trial=trial):
+                bundle = self.issue(
+                    rows, points,
+                    revision=f'r{trial}', plan=f'p{trial}', release=f'e{trial}',
+                )
+                wet_heights = {Fraction(raw['height'])
+                               for raw_row in rows for raw in raw_row if raw is not None}
+                waters = set()
+                for height in wet_heights:
+                    waters.update((height, height - Fraction(1, 2), height + Fraction(1, 2)))
+                for water in sorted(waters):
+                    for point in points:
+                        expected = flood_oracle(rows, (point['row'], point['column']), water)
+                        result = query_probe(bundle, point['probe_id'], water)
+                        self.assertEqual(
+                            (result.status, result.basin_id, result.volume), expected,
+                            f'BASIN_HANDOFF_MISMATCH: trial {trial} at {water}',
+                        )
+
+    def test_legacy_summary_format_readable(self):
+        # Packages written before the merge fix use the same v1 wire shape:
+        # level, basin number, introduced moments and a predecessor list that
+        # never exceeded one entry.  They must stay readable and evaluable
+        # without the source grid, and re-encode byte-for-byte.
+        source = SummarySource('old-plan', 'old-revision', 'a' * 64)
+        legacy_events = (
+            BasinEvent(Fraction(0), 0, BasinMoments(Fraction(1), Fraction(0)), ()),
+            BasinEvent(Fraction(1), 2, BasinMoments(Fraction(2), Fraction(2)), ()),
+            BasinEvent(Fraction(2), 0, BasinMoments(Fraction(1), Fraction(2)), (0,)),
+            BasinEvent(Fraction(3), 0, BasinMoments(Fraction(1), Fraction(3)), (2,)),
+        )
+        summary = BasinSummary(source, legacy_events, (('left', 0), ('right', 1)))
+        legacy = encode_bundle(ReleaseManifest('legacy', source, ('left', 'right')), summary)
+        session = open_session(legacy)
+        dry = query_probe(session, 'left', 0)
+        rising = [
+            (result.basin_id, result.volume)
+            for result in (query_probe(session, 'left', water) for water in ('1/2', '3/2', '5/2', '7/2'))
+        ]
+        self.assertEqual((dry.status, dry.basin_id, dry.volume), ('dry', None, None))
+        self.assertEqual(rising, [
+            (0, Fraction(1, 2)),
+            (0, Fraction(3, 2)),
+            (0, Fraction(3)),
+            (0, Fraction(11, 2)),
+        ])
+        # The other branch keeps its own partition: it never joins the left
+        # basin, whose later events list no matching predecessor.
+        self.assertEqual(query_probe(session, 'right', '3/2').volume, Fraction(1))
+        self.assertEqual(query_probe(session, 'right', 2).volume, Fraction(2))
+        self.assertEqual(query_probe(session, 'right', '7/2').volume, Fraction(5))
+        self.assertEqual(encode_bundle(session.manifest, session.summary), legacy)
+
+    def test_new_merge_summary_readable(self):
+        # A package that records two absorbed partitions in one predecessor
+        # list decodes, validates and evaluates offline.
+        source = SummarySource('merge-plan', 'merge-revision', 'b' * 64)
+        events = (
+            BasinEvent(Fraction(0), 0, BasinMoments(Fraction(1), Fraction(0)), ()),
+            BasinEvent(Fraction(0), 2, BasinMoments(Fraction(1), Fraction(0)), ()),
+            BasinEvent(Fraction(2), 0, BasinMoments(Fraction(1), Fraction(2)), (0, 1)),
+        )
+        summary = BasinSummary(source, events, (('left', 0), ('right', 1)))
+        bundle = encode_bundle(ReleaseManifest('merge', source, ('left', 'right')), summary)
+        session = open_session(bundle)
+        self.assertEqual(query_probe(session, 'left', 0).status, 'dry')
+        self.assertEqual(query_probe(session, 'left', '3/2').volume, Fraction(3, 2))
+        self.assertEqual(query_probe(session, 'left', 3).volume, Fraction(7))
+        self.assertEqual(query_probe(session, 'right', 3).volume, Fraction(7))

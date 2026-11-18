@@ -17,8 +17,9 @@ def build_history(
     levels: Iterable[ActivationLevel],
 ) -> BasinSummary:
     wet: set[int] = set()
-    heads: dict[int, int] = {}
-    starts: dict[int, int] = {}
+    # Each wet cell belongs to exactly one currently active partition.  A
+    # partition is identified by the event that produced its latest head.
+    owners: dict[int, int] = {}
     probe_cells = {probe.cell_id for probe in probes}
     probe_nodes: dict[int, int] = {}
     events: list[BasinEvent] = []
@@ -31,23 +32,23 @@ def build_history(
             if not introduced:
                 continue
             basin_id = min(component)
-            previous = heads.get(basin_id)
+            # Every still-active partition absorbed by this component keeps
+            # its own event as a predecessor; none may be dropped, otherwise
+            # its cells vanish from the merged basin's volume.
+            previous = tuple(sorted({
+                owners[cell_id] for cell_id in component if cell_id not in introduced
+            }))
             event_index = len(events)
             events.append(BasinEvent(
                 batch.height,
                 basin_id,
                 measure_cells(added[cell_id] for cell_id in sorted(introduced)),
-                () if previous is None else (previous,),
+                previous,
             ))
-            heads[basin_id] = event_index
-            if previous is None:
-                starts[basin_id] = event_index
-
-            for cell_id in component.intersection(probe_cells):
-                if cell_id in introduced:
-                    probe_nodes[cell_id] = event_index
-                elif events[probe_nodes[cell_id]].basin_id != basin_id:
-                    probe_nodes[cell_id] = starts[basin_id]
+            for cell_id in component:
+                owners[cell_id] = event_index
+            for cell_id in introduced.intersection(probe_cells):
+                probe_nodes[cell_id] = event_index
 
     roots = []
     for probe in probes:

@@ -33,13 +33,17 @@ def evaluate_probe(session: FieldSession, request: ProbeWaterRequest) -> ProbeRe
     current = selected
     area = Fraction(0)
     height_moment = Fraction(0)
-    while True:
-        event = events[current]
+    pending = [current]
+    visited: set[int] = set()
+    while pending:
+        event_index = pending.pop()
+        if event_index in visited:
+            continue
+        visited.add(event_index)
+        event = events[event_index]
         area += event.introduced.area
         height_moment += event.introduced.height_moment
-        if len(event.predecessors) != 1:
-            break
-        current = event.predecessors[0]
+        pending.extend(event.predecessors)
     volume = BasinMoments(area, height_moment).volume_at(request.water)
     return ProbeResult('wet', events[selected].basin_id, volume)
 
