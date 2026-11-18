@@ -1,0 +1,7 @@
+[
+  {"probe_id": "west", "row": 0, "column": 0},
+  {"probe_id": "center", "row": 0, "column": 2},
+  {"probe_id": "east", "row": 0, "column": 4},
+  {"probe_id": "west-saddle", "row": 0, "column": 1},
+  {"probe_id": "east-saddle", "row": 0, "column": 3}
+]
